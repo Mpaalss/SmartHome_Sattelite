@@ -22,10 +22,12 @@ _alsa = ctypes.cdll.LoadLibrary(ctypes.util.find_library("asound"))
 _alsa.snd_lib_error_set_handler(_error_handler)
 
 import numpy as np
+import onnxruntime as ort
 import pyaudio
 import usb.core
 import websockets
-from openwakeword.model import Model as WakewordModel
+from openwakeword.model import Model as OWWModel
+from openwakeword.utils import AudioFeatures
 
 log = logging.getLogger("satellite")
 
@@ -37,9 +39,10 @@ THOR_HTTP_URL = "http://192.168.50.163:9000/api/voice"
 THOR_WS_URL = "ws://192.168.50.163:9000/api/voice/stream"
 WAKEWORD_ACK_URL = "http://192.168.50.163:9000/api/assets/wakeword-ack.wav"
 WAKEWORD_ACK_PATH = os.path.join(os.path.dirname(__file__), "wakeword-ack.wav")
-WAKEWORD_MODEL = "hey_jarvis_v0.1"  # Oder custom "hey_thor" Modell
-WAKEWORD_MODEL_PATH = None  # Auto-resolved from openwakeword package
-WAKEWORD_THRESHOLD = 0.7
+WAKEWORD_MODEL = "hey_bernd"
+WAKEWORD_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hey_bernd.onnx")
+WAKEWORD_THRESHOLD = 0.65
+WAKEWORD_N_FRAMES = 13  # frames the model expects
 SAMPLE_RATE = 16000
 CHANNELS = 2  # XVF3800 liefert 2ch: CH0=AEC ref, CH1=ASR beam
 ASR_CHANNEL = 1  # Beamformed + noise-suppressed output
@@ -100,6 +103,63 @@ class LedRing:
 
     def off(self):
         self._set(12, [0])
+
+
+# ---------------------------------------------------------------------------
+# Custom Wakeword Detector
+# ---------------------------------------------------------------------------
+class WakewordDetector:
+    """Wakeword detection using AudioFeatures embeddings + custom ONNX classifier."""
+
+    # embed_clips needs >= 76 mel frames = ~1.2s of audio at 16kHz
+    MIN_AUDIO_SAMPLES = int(1.3 * SAMPLE_RATE)
+
+    PREDICT_EVERY_N = 5  # Only run embedding every N chunks (~400ms at 80ms chunks)
+
+    def __init__(self, model_path: str, n_frames: int = WAKEWORD_N_FRAMES):
+        self._af = AudioFeatures()
+        self._session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        self._n_frames = n_frames
+        self._audio_buffer = collections.deque(maxlen=int(2.0 * SAMPLE_RATE / CHUNK_SIZE))
+        self._input_name = self._session.get_inputs()[0].name
+        self._chunk_count = 0
+        self._last_score = 0.0
+        log.info("WakewordDetector loaded: %s (%d frames, predict every %dms)",
+                 model_path, n_frames, self.PREDICT_EVERY_N * CHUNK_MS)
+
+    def predict(self, audio_chunk: np.ndarray) -> float:
+        """Feed a mono int16 audio chunk, return wakeword score (0-1)."""
+        self._audio_buffer.append(audio_chunk.copy())
+        self._chunk_count += 1
+
+        # Only run expensive embedding every N chunks
+        if self._chunk_count % self.PREDICT_EVERY_N != 0:
+            return self._last_score
+
+        # Need enough audio for embedding extraction
+        total_samples = sum(len(c) for c in self._audio_buffer)
+        if total_samples < self.MIN_AUDIO_SAMPLES:
+            return 0.0
+
+        # Concatenate sliding window of audio
+        audio = np.concatenate(list(self._audio_buffer))
+        emb = self._af.embed_clips(audio.reshape(1, -1))
+
+        if emb is None or emb.shape[1] < self._n_frames:
+            return 0.0
+
+        # Take last n_frames
+        frames = emb[0, -self._n_frames:, :].astype(np.float32)
+        inp = frames.reshape(1, self._n_frames, 96)
+        logit = self._session.run(None, {self._input_name: inp})[0]
+        self._last_score = float(1.0 / (1.0 + np.exp(-logit.flatten()[0])))
+        return self._last_score
+
+    def reset(self):
+        """Clear internal buffers after a detection."""
+        self._audio_buffer.clear()
+        self._chunk_count = 0
+        self._last_score = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -167,19 +227,24 @@ def load_wakeword_ack() -> bytes:
 class Speaker:
     """Persistent audio output on reSpeaker. Supports interrupt for new wakeword."""
 
-    def __init__(self, device_index: int):
-        self._pa = pyaudio.PyAudio()
-        self._stream = self._pa.open(
-            format=pyaudio.paInt16,
-            channels=SPEAKER_CHANNELS,
-            rate=SPEAKER_RATE,
-            output=True,
-            output_device_index=device_index,
-        )
+    def __init__(self, pa: pyaudio.PyAudio, device_index: int):
+        self._pa = pa
+        self._device_index = device_index
+        self._stream = None
         self._stop_event = threading.Event()
         self._play_thread = None
-        log.info("Speaker stream opened (device=%d, %dHz, %dch)",
+        log.info("Speaker ready (device=%d, %dHz, %dch)",
                  device_index, SPEAKER_RATE, SPEAKER_CHANNELS)
+
+    def _ensure_stream(self):
+        if self._stream is None:
+            self._stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=SPEAKER_CHANNELS,
+                rate=SPEAKER_RATE,
+                output=True,
+                output_device_index=self._device_index,
+            )
 
     def play_async(self, pcm_bytes: bytes):
         """Play PCM bytes in background thread. Non-blocking. Interrupts previous."""
@@ -194,6 +259,7 @@ class Speaker:
 
     def _play(self, pcm_bytes: bytes):
         try:
+            self._ensure_stream()
             self._started.set()
             chunk_bytes = SPEAKER_RATE * SPEAKER_CHANNELS * 2 // 10  # 100ms
             offset = 0
@@ -206,6 +272,7 @@ class Speaker:
 
     def write(self, pcm_bytes: bytes):
         """Write PCM directly to output stream. Blocks until played."""
+        self._ensure_stream()
         self._stream.write(pcm_bytes)
 
     def stop(self):
@@ -220,9 +287,9 @@ class Speaker:
 
     def close(self):
         self.stop()
-        self._stream.stop_stream()
-        self._stream.close()
-        self._pa.terminate()
+        if self._stream:
+            self._stream.stop_stream()
+            self._stream.close()
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +399,10 @@ class ThorConnection:
         # Receive response: text result, then streamed TTS audio
         result = None
         audio_sr = None
+        leftover = b''  # buffer for incomplete int16 samples
+        pending_write = None  # track last speaker.write future
+        total_audio_bytes = 0
+        total_playback_bytes = 0
 
         while True:
             msg = await asyncio.wait_for(self._ws.recv(), timeout=30)
@@ -342,13 +413,20 @@ class ThorConnection:
 
                 if msg_type == "audio_start":
                     audio_sr = data.get("sample_rate", 44100)
+                    leftover = b''
                     # Prime speaker with 50ms silence to avoid cold-start underrun
                     prime = b'\x00' * int(SPEAKER_RATE * SPEAKER_CHANNELS * 2 * 0.05)
                     self._speaker.write(prime)
                     log.info("TTS audio stream starting (sr=%d)", audio_sr)
 
                 elif msg_type == "audio_end":
-                    log.info("TTS playback complete")
+                    # Wait for last speaker write to finish
+                    if pending_write is not None:
+                        await pending_write
+                    audio_dur = total_audio_bytes / (2 * (audio_sr or 44100))
+                    playback_dur = total_playback_bytes / (SPEAKER_RATE * SPEAKER_CHANNELS * 2)
+                    log.info("TTS playback complete (recv=%.1fs @%dHz, playback=%.1fs @%dHz)",
+                             audio_dur, audio_sr or 44100, playback_dur, SPEAKER_RATE)
                     break
 
                 elif "error" in data:
@@ -363,10 +441,22 @@ class ThorConnection:
                     log.info("Zeiten: %s", result.get("timings", ""))
 
             elif isinstance(msg, bytes) and audio_sr:
-                # Resample and write directly to speaker — blocks until played
-                samples = np.frombuffer(msg, dtype=np.int16).copy()
-                pcm = resample_to_speaker(samples, audio_sr)
-                self._speaker.write(pcm)
+                # Prepend any leftover byte from previous chunk
+                raw = leftover + msg
+                # Ensure even number of bytes for int16
+                usable = len(raw) - (len(raw) % 2)
+                leftover = raw[usable:]
+                if usable > 0:
+                    total_audio_bytes += usable
+                    samples = np.frombuffer(raw[:usable], dtype=np.int16).copy()
+                    pcm = resample_to_speaker(samples, audio_sr)
+                    total_playback_bytes += len(pcm)
+                    # Run blocking write in thread to not block ws.recv()
+                    if pending_write is not None:
+                        await pending_write
+                    pending_write = asyncio.get_event_loop().run_in_executor(
+                        None, self._speaker.write, pcm
+                    )
 
         return result, result is not None
 
@@ -411,24 +501,12 @@ def main():
     log.info("Thor WS: %s", THOR_WS_URL)
     log.info("Wakeword: %s (threshold %.1f)", WAKEWORD_MODEL, WAKEWORD_THRESHOLD)
 
-    # Resolve wakeword model path
-    if WAKEWORD_MODEL_PATH:
-        model_path = WAKEWORD_MODEL_PATH
-    else:
-        import openwakeword
-        for p in openwakeword.get_pretrained_model_paths():
-            if WAKEWORD_MODEL in p:
-                model_path = p
-                break
-        else:
-            raise FileNotFoundError(f"Wakeword model '{WAKEWORD_MODEL}' not found")
-
     # Init LED ring
     led = LedRing()
 
-    # Init wakeword model
-    oww = WakewordModel(wakeword_model_paths=[model_path])
-    log.info("OpenWakeWord loaded: %s", model_path)
+    # Init wakeword detector
+    oww = WakewordDetector(WAKEWORD_MODEL_PATH)
+    log.info("Wakeword model: %s", WAKEWORD_MODEL_PATH)
 
     # Load wakeword ACK sound
     ack_pcm = load_wakeword_ack()
@@ -447,8 +525,8 @@ def main():
     )
     log.info("Mikrofon: %s (index=%d, %dHz, %dms chunks)", mic_name, mic_index, SAMPLE_RATE, CHUNK_MS)
 
-    # Speaker
-    speaker = Speaker(device_index=mic_index)
+    # Speaker (share PyAudio instance)
+    speaker = Speaker(pa, device_index=mic_index)
 
     # Ringbuffer
     max_chunks = int(RINGBUFFER_SECONDS * 1000 / CHUNK_MS)
@@ -469,13 +547,11 @@ def main():
 
         # Feed to wakeword
         audio_np = np.frombuffer(mono, dtype=np.int16)
-        scores = oww.predict(audio_np)
+        score = oww.predict(audio_np)
 
-        # Check all wakeword models
-        for name, current_score in scores.items():
-            if current_score > 0.1:
-                log.debug("%s: %.3f", name, current_score)
-            if current_score > WAKEWORD_THRESHOLD:
+        if score > 0.1:
+            log.debug("%s: %.3f", WAKEWORD_MODEL, score)
+        if score > WAKEWORD_THRESHOLD:
                 # Stop any active playback (interrupt for new command)
                 speaker.stop()
 
@@ -484,7 +560,7 @@ def main():
                 baseline_rms = sum(rms_values) / len(rms_values) if rms_values else 500
                 silence_threshold = baseline_rms * SILENCE_DROP_FACTOR
                 log.info("Wakeword '%s' erkannt (score=%.2f, baseline=%.0f, thr=%.0f)",
-                         name, current_score, baseline_rms, silence_threshold)
+                         WAKEWORD_MODEL, score, baseline_rms, silence_threshold)
 
                 # Play ACK sound and drain mic while it plays
                 speaker.play_async(ack_pcm)
@@ -542,10 +618,7 @@ def main():
                 stream.stop_stream()
                 stream.start_stream()
                 oww.reset()
-                silence = np.zeros(CHUNK_SIZE, dtype=np.int16)
-                for _ in range(20):
-                    oww.predict(silence)
-                log.debug("flushed, scores: %s", oww.predict(silence))
+                log.debug("flushed")
 
                 # Reconnect WS if dropped
                 if not thor.connected:
